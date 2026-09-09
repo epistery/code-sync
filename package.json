@@ -1,0 +1,24 @@
+{
+  "name": "@epistery/code-sync",
+  "version": "1.0.0",
+  "description": "Keep an epistery service's own git checkout in sync with a branch and self-restart. Poll or trigger; ff-only or reset-hard; install only when deps change.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "dependencies": {
+    "epistery": "^2.3.0"
+  },
+  "license": "MIT",
+  "author": "Rootz Corp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/epistery/code-sync.git"
+  }
+}
