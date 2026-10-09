@@ -6,10 +6,15 @@
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./boot.mjs": "./boot.mjs",
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "code-sync-boot": "./boot.mjs"
   },
   "files": [
     "index.mjs",
+    "boot.mjs",
     "README.md"
   ],
   "dependencies": {

@@ -3,10 +3,7 @@
  *
  * The one place the "advance a git checkout to a branch, then act" logic lives,
  * so services stop each rolling their own (harness/sync.mjs, epistery-host's
- * PluginManager/AgentManager). It deliberately does NOT depend on
- * @metric-im/administrate (whose Synchronize is the very thing services copied
- * to avoid that dep) and is NOT part of core `epistery` (tight public
- * middleware — no ops code there).
+ * PluginManager/AgentManager).
  *
  * The shared CORE is `syncCheckout()`: fetch, no-op when already current, then
  * advance and (only when deps changed) install. Everything that legitimately
@@ -32,6 +29,9 @@
  * is that caller's concern, not this core's — add it as a param if/when it migrates.
  */
 import { spawn } from 'child_process';
+import { createHash } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { Config } from 'epistery';
 
 // Fail fast instead of hanging on an auth prompt when a remote needs credentials.
@@ -59,6 +59,39 @@ async function git(args, cwd) {
 async function depsChanged(dir, before, after) {
   const r = await run('git', ['diff', '--quiet', before, after, '--', 'package.json', 'package-lock.json'], dir);
   return r.code !== 0;
+}
+
+// --- deps-vs-lock reconciliation (used by reconcile/bootstrap) ---------------
+// `depsChanged` above is keyed to a GIT ADVANCE — it only knows deps moved when
+// HEAD moved this run. That misses the crash-loop case: a box already sitting on
+// new code with stale `node_modules` (a push landed while it was down, or an
+// earlier advance's install failed). These helpers compare what is INSTALLED to
+// the ON-DISK lock, so reconcile can heal that box on a restart even though git
+// did not move. The marker lives inside node_modules (npm ci wipes it, so it is
+// rewritten only after a successful install) and holds the hash of the lock it
+// was installed from.
+const INSTALLED_MARKER = ['node_modules', '.code-sync-installed'];
+
+function lockHash(dir) {
+  try { return createHash('sha256').update(readFileSync(join(dir, 'package-lock.json'))).digest('hex'); }
+  catch { return null; }   // no lockfile → nothing to reconcile against
+}
+
+function installedMatchesLock(dir) {
+  const want = lockHash(dir);
+  if (want === null) return true;                       // no lock: nothing to match
+  if (!existsSync(join(dir, 'node_modules'))) return false;
+  try { return readFileSync(join(dir, ...INSTALLED_MARKER), 'utf8').trim() === want; }
+  catch { return false; }                               // no/unreadable marker → not reconciled yet
+}
+
+function markInstalled(dir) {
+  const want = lockHash(dir);
+  if (want === null) return;
+  try {
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });   // a zero-dep `npm ci` leaves no node_modules
+    writeFileSync(join(dir, ...INSTALLED_MARKER), want);
+  } catch { /* best effort — a missed marker only costs one extra ci next boot */ }
 }
 
 /**
@@ -93,6 +126,7 @@ export async function syncCheckout({ dir, branch = 'main', advance = 'ff-only', 
     const args = installer || ['ci', '--no-audit', '--no-fund'];
     const r = await run('npm', args, dir);
     if (r.code !== 0) throw new Error(`npm ${args.join(' ')} failed (exit ${r.code}): ${r.stderr || r.stdout}`);
+    markInstalled(dir);   // record the lock we installed from, so bootstrap's reconcile no-ops next boot
   }
   return { advanced: true, before, after, installed: wantInstall };
 }
@@ -181,4 +215,79 @@ export async function attach({ dir, section = 'code-sync', onAdvance, logger = c
   const install = sec.install || 'if-changed';
   logger?.log?.(`[code-sync] tracking origin/${branch} (poll ${intervalMs / 1000}s) from [${section}] config`);
   return poll({ dir, branch, intervalMs, advance, install, onAdvance, logger });
+}
+
+/**
+ * Make a checkout fit to boot, then leave it: advance to origin/<branch> (like
+ * syncCheckout) AND guarantee `node_modules` matches the ON-DISK lock — the second
+ * part independent of whether git moved this run. syncCheckout installs only on a
+ * git advance, so it cannot heal a box already on new code with stale deps; this
+ * does, by comparing installed-vs-lock rather than before-vs-after.
+ *
+ * Throws (does not swallow) if the advance or install fails — the caller
+ * (bootstrap) turns that into a clean non-start so the app never loads half-synced.
+ *
+ * @returns {Promise<{advanced:boolean, before:string, after:string, installed:boolean}>}
+ */
+export async function reconcile({ dir, branch = 'main', advance = 'ff-only', installer } = {}) {
+  if (!dir) throw new Error('code-sync: dir is required');
+  // Advance the code but do NOT let syncCheckout decide the install — we own it,
+  // keyed to installed-vs-lock so a HEAD that didn't move is still reconciled.
+  const res = await syncCheckout({ dir, branch, advance, install: 'never', installer });
+  let installed = false;
+  if (!installedMatchesLock(dir)) {
+    const args = installer || ['ci', '--no-audit', '--no-fund'];
+    const r = await run('npm', args, dir);
+    if (r.code !== 0) throw new Error(`npm ${args.join(' ')} failed (exit ${r.code}): ${r.stderr || r.stdout}`);
+    markInstalled(dir);
+    installed = true;
+  }
+  return { ...res, installed };
+}
+
+/**
+ * Pre-import entrypoint. Make this the service's process entry (see boot.mjs):
+ * it reconciles the checkout to a bootable state BEFORE the app's modules load,
+ * then imports the app. Because the reconcile runs before any app import, a
+ * module-link failure (a pushed import whose dependency isn't installed yet) can
+ * no longer pre-empt it — systemd's next restart heals the box instead of
+ * crash-looping. This is the piece `attach()` structurally cannot be: attach runs
+ * inside the app, after its imports, so it never gets to run on a boot that fails
+ * at link.
+ *
+ * Config-gated exactly like attach(): no `[code-sync]` section (or enabled=false)
+ * means dev / un-managed — the reconcile is SKIPPED (so it never `npm ci`s over a
+ * developer's linked node_modules) and the app is imported directly, identical to
+ * `node <entry>`.
+ *
+ * @param {object} opts
+ * @param {string} opts.dir     checkout root (contains .git); boot.mjs passes process.cwd()
+ * @param {string} opts.entry   the app module to import once reconciled (a file URL or specifier)
+ * @param {string} [opts.section='code-sync']
+ */
+export async function bootstrap({ dir, entry, section = 'code-sync', logger = console } = {}) {
+  if (!dir) throw new Error('code-sync: dir is required');
+  if (!entry) throw new Error('code-sync: entry is required');
+  let sec = null;
+  try {
+    const cfg = new Config();
+    await cfg.setPath('/');
+    sec = cfg.data?.[section] || null;
+  } catch (e) {
+    logger?.warn?.(`[code-sync] bootstrap: could not read Config — starting without reconcile: ${e.message}`);
+  }
+  const enabled = sec && !OFF.has(String(sec.enabled ?? '').toLowerCase());
+  if (enabled) {
+    try {
+      const res = await reconcile({ dir, branch: sec.branch || 'main', advance: sec.advance || 'ff-only' });
+      logger?.log?.(`[code-sync] bootstrap reconciled ${res.before.slice(0, 7)}→${res.after.slice(0, 7)}` +
+        `${res.installed ? ' (deps installed)' : ' (deps current)'}`);
+    } catch (e) {
+      logger?.error?.(`[code-sync] bootstrap reconcile failed — refusing to start on mismatched deps: ${e.message}`);
+      process.exit(1);   // systemd Restart=always retries; never launch the app half-synced
+    }
+  } else {
+    logger?.log?.('[code-sync] bootstrap: no [code-sync] config — starting directly (dev / un-managed)');
+  }
+  await import(entry);
 }
