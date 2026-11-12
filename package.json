@@ -18,7 +18,7 @@
     "README.md"
   ],
   "dependencies": {
-    "epistery": "^2.6.2"
+    "epistery": "^2.6.3"
   },
   "license": "MIT",
   "author": "Rootz Corp",
